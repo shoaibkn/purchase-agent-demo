@@ -2,17 +2,65 @@ import {
   AgentRunStatus,
   AgentRunTrigger,
   MessageDirection,
-  Prisma,
   PurchaseOrderLineStatus,
   PurchaseOrderStatus,
   ReminderTaskStatus,
   ReminderTaskType,
+  SenderType,
 } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
+
+type TxClient = Prisma.TransactionClient | PrismaClient;
 import { addDays, addHours, format } from "date-fns";
 import { z } from "zod";
 
 import { getModel } from "@/lib/ai";
 import { db } from "@/lib/db";
+import { sendEmail } from "@/lib/email";
+
+async function sendOutboundEmail(tx: TxClient, params: {
+  threadId: string;
+  fromEmail: string;
+  toEmails: string[];
+  subject: string;
+  body: string;
+  intent?: string;
+  senderType: SenderType;
+}) {
+  const { threadId, fromEmail, toEmails, subject, body, intent, senderType } = params;
+
+  const appSetting = await tx.appSetting?.findFirst?.({ orderBy: { createdAt: "asc" } }) ?? await db.appSetting.findFirst({ orderBy: { createdAt: "asc" } });
+  const useRealEmail = appSetting?.useRealEmail ?? false;
+
+  let messageId: string | undefined;
+
+  if (useRealEmail) {
+    const result = await sendEmail({
+      to: toEmails,
+      subject,
+      body,
+      replyTo: fromEmail,
+    });
+
+    if (result.success && result.messageId) {
+      messageId = result.messageId;
+    }
+  }
+
+  return tx.emailMessage.create({
+    data: {
+      threadId,
+      direction: MessageDirection.OUTBOUND,
+      senderType,
+      fromEmail,
+      toEmails,
+      subject,
+      body,
+      intent,
+      metadata: messageId ? { resendMessageId: messageId } : {},
+    },
+  });
+}
 
 const lineInputSchema = z.object({
   materialId: z.string().min(1),
@@ -21,14 +69,43 @@ const lineInputSchema = z.object({
   requestedDate: z.string().datetime().optional(),
 });
 
+const inboundLineUpdateSchema = z.object({
+  lineId: z.string().min(1),
+  proposedDate: z.string().datetime(),
+  note: z.string().max(500).optional(),
+});
+
 export const createPurchaseOrderSchema = z.object({
   supplierId: z.string().min(1),
   notes: z.string().max(2000).optional(),
   model: z.string().min(1).optional(),
+  simulateReply: z.boolean().optional(),
   lines: z.array(lineInputSchema).min(1),
 });
 
+export const simulatedInboundEmailSchema = z.object({
+  poNumber: z.string().min(1),
+  fromEmail: z.string().email().optional(),
+  body: z.string().min(1),
+  lineUpdates: z.array(inboundLineUpdateSchema).min(1),
+  model: z.string().min(1).optional(),
+});
+
+const receiptLineSchema = z.object({
+  lineId: z.string().min(1),
+  acceptedQty: z.number().min(0),
+  rejectedQty: z.number().min(0).optional(),
+});
+
+export const receiveGoodsSchema = z.object({
+  reference: z.string().max(120).optional(),
+  receivedAt: z.string().datetime().optional(),
+  lines: z.array(receiptLineSchema).min(1),
+});
+
 type CreatePurchaseOrderInput = z.infer<typeof createPurchaseOrderSchema>;
+type SimulatedInboundEmailInput = z.infer<typeof simulatedInboundEmailSchema>;
+type ReceiveGoodsInput = z.infer<typeof receiveGoodsSchema>;
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -255,16 +332,14 @@ export async function createPurchaseOrder(input: CreatePurchaseOrderInput) {
       model: selectedModel,
     });
 
-    await tx.emailMessage.create({
-      data: {
-        threadId: thread.id,
-        direction: MessageDirection.OUTBOUND,
-        fromEmail: "buyer@demo-manufacturing.example",
-        toEmails: [supplier.primaryEmail, ...supplier.ccEmails],
-        subject: `[${poNumber}] New Purchase Order`,
-        body: outboundBody,
-        intent: "po_created_notification",
-      },
+    await sendOutboundEmail(tx, {
+      threadId: thread.id,
+      fromEmail: "buyer@demo-manufacturing.example",
+      toEmails: [supplier.primaryEmail, ...supplier.ccEmails],
+      subject: `[${poNumber}] New Purchase Order`,
+      body: outboundBody,
+      intent: "po_created_notification",
+      senderType: SenderType.PURCHASER,
     });
 
     const agentRun = await tx.agentRun.create({
@@ -317,44 +392,57 @@ export async function createPurchaseOrder(input: CreatePurchaseOrderInput) {
       });
     }
 
-    const inboundBody = buildSupplierReplyEmail({
-      supplierName: supplier.name,
-      poNumber,
-      confirmations: confirmations.map((confirmation) => ({
-        materialName: confirmation.line.material.name,
-        orderedQty: confirmation.line.orderedQty,
-        requestedDate: confirmation.line.requestedDate,
-        promisedDate: confirmation.promisedDate,
-        reason: confirmation.reason,
-      })),
-    });
+    const simulateReply = input.simulateReply ?? true;
 
-    await tx.emailMessage.create({
-      data: {
-        threadId: thread.id,
-        direction: MessageDirection.INBOUND,
-        fromEmail: supplier.primaryEmail,
-        toEmails: ["buyer@demo-manufacturing.example"],
-        subject: `Re: [${poNumber}] New Purchase Order`,
-        body: inboundBody,
-        intent: "supplier_ack_with_edd",
-      },
-    });
+    if (simulateReply) {
+      const inboundBody = buildSupplierReplyEmail({
+        supplierName: supplier.name,
+        poNumber,
+        confirmations: confirmations.map((confirmation) => ({
+          materialName: confirmation.line.material.name,
+          orderedQty: confirmation.line.orderedQty,
+          requestedDate: confirmation.line.requestedDate,
+          promisedDate: confirmation.promisedDate,
+          reason: confirmation.reason,
+        })),
+      });
 
-    await tx.purchaseOrder.update({
-      where: { id: purchaseOrder.id },
-      data: {
-        status: PurchaseOrderStatus.ACKNOWLEDGED,
-      },
-    });
+      await tx.emailMessage.create({
+        data: {
+          threadId: thread.id,
+          direction: MessageDirection.INBOUND,
+          senderType: SenderType.SUPPLIER,
+          fromEmail: supplier.primaryEmail,
+          toEmails: ["buyer@demo-manufacturing.example"],
+          subject: `Re: [${poNumber}] New Purchase Order`,
+          body: inboundBody,
+          intent: "supplier_ack_with_edd",
+        },
+      });
 
-    await tx.agentRun.update({
-      where: { id: agentRun.id },
-      data: {
-        status: AgentRunStatus.SUCCESS,
-        decision: "PO notification sent and supplier acknowledgment simulated with line-level EDD commitments.",
-      },
-    });
+      await tx.purchaseOrder.update({
+        where: { id: purchaseOrder.id },
+        data: {
+          status: PurchaseOrderStatus.ACKNOWLEDGED,
+        },
+      });
+
+      await tx.agentRun.update({
+        where: { id: agentRun.id },
+        data: {
+          status: AgentRunStatus.SUCCESS,
+          decision: "PO notification sent and supplier acknowledgment simulated with line-level EDD commitments.",
+        },
+      });
+    } else {
+      await tx.agentRun.update({
+        where: { id: agentRun.id },
+        data: {
+          status: AgentRunStatus.SUCCESS,
+          decision: "PO notification sent. Awaiting supplier acknowledgment.",
+        },
+      });
+    }
 
     return tx.purchaseOrder.findUniqueOrThrow({
       where: { id: purchaseOrder.id },
@@ -396,6 +484,333 @@ export async function listPurchaseOrders() {
   });
 }
 
+export async function processSimulatedInboundEmail(input: SimulatedInboundEmailInput) {
+  return db.$transaction(async (tx) => {
+    const purchaseOrder = await tx.purchaseOrder.findUnique({
+      where: { poNumber: input.poNumber },
+      include: {
+        supplier: true,
+        lines: {
+          include: {
+            material: true,
+          },
+        },
+        emailThreads: {
+          orderBy: { createdAt: "asc" },
+        },
+      },
+    });
+
+    if (!purchaseOrder) {
+      throw new Error("Purchase order not found.");
+    }
+
+    const appSetting = await tx.appSetting.findFirst({ orderBy: { createdAt: "asc" } });
+    const selectedModel = input.model ?? appSetting?.defaultModel ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+    const lineMap = new Map(purchaseOrder.lines.map((line) => [line.id, line]));
+    for (const update of input.lineUpdates) {
+      if (!lineMap.has(update.lineId)) {
+        throw new Error(`Line ${update.lineId} does not belong to PO ${input.poNumber}.`);
+      }
+    }
+
+    const thread =
+      purchaseOrder.emailThreads[0] ??
+      (await tx.emailThread.create({
+        data: {
+          purchaseOrderId: purchaseOrder.id,
+          supplierId: purchaseOrder.supplierId,
+          subject: `[${purchaseOrder.poNumber}] Purchase Order Thread`,
+        },
+      }));
+
+    await tx.emailMessage.create({
+      data: {
+        threadId: thread.id,
+        direction: MessageDirection.INBOUND,
+        senderType: SenderType.SUPPLIER,
+        fromEmail: input.fromEmail ?? purchaseOrder.supplier.primaryEmail,
+        toEmails: ["buyer@demo-manufacturing.example"],
+        subject: `Re: [${purchaseOrder.poNumber}] Purchase Order Update`,
+        body: input.body,
+        intent: "supplier_update_manual",
+      },
+    });
+
+    const agentRun = await tx.agentRun.create({
+      data: {
+        purchaseOrderId: purchaseOrder.id,
+        trigger: AgentRunTrigger.SUPPLIER_REPLY_RECEIVED,
+        model: selectedModel,
+        decision: "Supplier inbound email received. Processing line-level EDD updates.",
+        status: AgentRunStatus.PENDING,
+      },
+    });
+
+    for (const update of input.lineUpdates) {
+      const poLine = lineMap.get(update.lineId);
+      if (!poLine) {
+        continue;
+      }
+
+      const proposedDate = new Date(update.proposedDate);
+      const isApprovedRequest = !poLine.requestedDate || proposedDate <= poLine.requestedDate;
+
+      await tx.purchaseOrderLine.update({
+        where: { id: poLine.id },
+        data: {
+          approvedDate: proposedDate,
+          latestEdd: proposedDate,
+          lineStatus: isApprovedRequest ? PurchaseOrderLineStatus.CONFIRMED : PurchaseOrderLineStatus.RESCHEDULED,
+          deliveryCommitments: {
+            create: {
+              promisedDate: proposedDate,
+              promisedQty: poLine.openQty,
+              source: "Supplier",
+            },
+          },
+        },
+      });
+
+      await tx.reminderTask.create({
+        data: {
+          purchaseOrderId: purchaseOrder.id,
+          poLineId: poLine.id,
+          type: ReminderTaskType.EDD_OVERDUE_FOLLOWUP,
+          runAt: proposedDate,
+          status: ReminderTaskStatus.PENDING,
+        },
+      });
+    }
+
+    const allLines = await tx.purchaseOrderLine.findMany({
+      where: { purchaseOrderId: purchaseOrder.id },
+    });
+    const allConfirmed = allLines.every(
+      (line) =>
+        line.lineStatus === PurchaseOrderLineStatus.CONFIRMED ||
+        line.lineStatus === PurchaseOrderLineStatus.RESCHEDULED,
+    );
+
+    if (allConfirmed) {
+      await tx.purchaseOrder.update({
+        where: { id: purchaseOrder.id },
+        data: {
+          status: PurchaseOrderStatus.ACKNOWLEDGED,
+        },
+      });
+    }
+
+    await tx.agentRun.update({
+      where: { id: agentRun.id },
+      data: {
+        status: AgentRunStatus.SUCCESS,
+        decision: "Inbound supplier response processed and EDD updates recorded.",
+      },
+    });
+
+    return tx.purchaseOrder.findUniqueOrThrow({
+      where: { id: purchaseOrder.id },
+      include: {
+        supplier: true,
+        lines: {
+          include: {
+            material: true,
+            deliveryCommitments: {
+              orderBy: { createdAt: "desc" },
+            },
+          },
+        },
+        emailThreads: {
+          include: {
+            messages: {
+              orderBy: { createdAt: "asc" },
+            },
+          },
+        },
+        agentRuns: {
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    });
+  });
+}
+
+export async function receiveGoodsAgainstPurchaseOrder(poNumber: string, input: ReceiveGoodsInput) {
+  return db.$transaction(async (tx) => {
+    const purchaseOrder = await tx.purchaseOrder.findUnique({
+      where: { poNumber },
+      include: {
+        supplier: true,
+        lines: {
+          include: {
+            material: true,
+          },
+        },
+        emailThreads: {
+          orderBy: { createdAt: "asc" },
+        },
+      },
+    });
+
+    if (!purchaseOrder) {
+      throw new Error("Purchase order not found.");
+    }
+
+    const lineMap = new Map(purchaseOrder.lines.map((line) => [line.id, line]));
+    const receiptRows = input.lines
+      .map((line) => ({
+        lineId: line.lineId,
+        acceptedQty: line.acceptedQty,
+        rejectedQty: line.rejectedQty ?? 0,
+      }))
+      .filter((line) => line.acceptedQty > 0 || line.rejectedQty > 0);
+
+    if (receiptRows.length === 0) {
+      throw new Error("At least one receipt line must have accepted or rejected quantity.");
+    }
+
+    for (const row of receiptRows) {
+      const poLine = lineMap.get(row.lineId);
+      if (!poLine) {
+        throw new Error(`Line ${row.lineId} is not part of purchase order ${poNumber}.`);
+      }
+
+      const openQty = Number(poLine.openQty.toString());
+      if (row.acceptedQty > openQty) {
+        throw new Error(`Accepted quantity exceeds open quantity for line ${poLine.id}.`);
+      }
+    }
+
+    const goodsReceipt = await tx.goodsReceipt.create({
+      data: {
+        purchaseOrderId: purchaseOrder.id,
+        reference: input.reference,
+        receivedAt: input.receivedAt ? new Date(input.receivedAt) : new Date(),
+      },
+    });
+
+    for (const row of receiptRows) {
+      const poLine = lineMap.get(row.lineId);
+      if (!poLine) {
+        continue;
+      }
+
+      await tx.goodsReceiptLine.create({
+        data: {
+          goodsReceiptId: goodsReceipt.id,
+          poLineId: poLine.id,
+          receivedQty: row.acceptedQty + row.rejectedQty,
+          acceptedQty: row.acceptedQty,
+          rejectedQty: row.rejectedQty,
+        },
+      });
+
+      const currentOpenQty = Number(poLine.openQty.toString());
+      const newOpenQty = Math.max(0, currentOpenQty - row.acceptedQty);
+
+      await tx.purchaseOrderLine.update({
+        where: { id: poLine.id },
+        data: {
+          openQty: newOpenQty,
+          lineStatus: newOpenQty === 0 ? PurchaseOrderLineStatus.RECEIVED : PurchaseOrderLineStatus.PARTIALLY_RECEIVED,
+        },
+      });
+
+      if (newOpenQty > 0 && poLine.latestEdd && poLine.latestEdd < new Date()) {
+        await tx.reminderTask.create({
+          data: {
+            purchaseOrderId: purchaseOrder.id,
+            poLineId: poLine.id,
+            type: ReminderTaskType.EDD_OVERDUE_FOLLOWUP,
+            runAt: addDays(new Date(), 1),
+            status: ReminderTaskStatus.PENDING,
+          },
+        });
+      }
+    }
+
+    const refreshedLines = await tx.purchaseOrderLine.findMany({
+      where: { purchaseOrderId: purchaseOrder.id },
+    });
+    const allReceived = refreshedLines.every((line) => Number(line.openQty.toString()) === 0);
+    const anyReceived = refreshedLines.some((line) => Number(line.openQty.toString()) < Number(line.orderedQty.toString()));
+
+    let nextPoStatus: PurchaseOrderStatus = purchaseOrder.status;
+    if (allReceived) {
+      nextPoStatus = PurchaseOrderStatus.CLOSED;
+    } else if (anyReceived) {
+      nextPoStatus = PurchaseOrderStatus.PARTIALLY_RECEIVED;
+    }
+
+    await tx.purchaseOrder.update({
+      where: { id: purchaseOrder.id },
+      data: {
+        status: nextPoStatus,
+      },
+    });
+
+    const thread =
+      purchaseOrder.emailThreads[0] ??
+      (await tx.emailThread.create({
+        data: {
+          purchaseOrderId: purchaseOrder.id,
+          supplierId: purchaseOrder.supplierId,
+          subject: `[${purchaseOrder.poNumber}] Purchase Order Thread`,
+        },
+      }));
+
+    await sendOutboundEmail(tx, {
+      threadId: thread.id,
+      fromEmail: "buyer@demo-manufacturing.example",
+      toEmails: [purchaseOrder.supplier.primaryEmail, ...purchaseOrder.supplier.ccEmails],
+      subject: `[${purchaseOrder.poNumber}] Goods Receipt Update`,
+      body: `Goods receipt ${goodsReceipt.reference ?? goodsReceipt.id} recorded for PO ${purchaseOrder.poNumber}. Please review outstanding quantities for remaining lines if any.`,
+      intent: "goods_receipt_posted",
+      senderType: SenderType.PURCHASER,
+    });
+
+    await tx.agentRun.create({
+      data: {
+        purchaseOrderId: purchaseOrder.id,
+        trigger: AgentRunTrigger.GOODS_RECEIPT_CREATED,
+        model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+        decision: `Goods receipt posted with ${receiptRows.length} lines. PO status set to ${nextPoStatus}.`,
+        status: AgentRunStatus.SUCCESS,
+      },
+    });
+
+    return tx.purchaseOrder.findUniqueOrThrow({
+      where: { id: purchaseOrder.id },
+      include: {
+        supplier: true,
+        lines: {
+          include: {
+            material: true,
+            deliveryCommitments: {
+              orderBy: { createdAt: "desc" },
+            },
+          },
+        },
+        goodsReceipts: {
+          include: {
+            lines: true,
+          },
+          orderBy: { createdAt: "desc" },
+        },
+        emailThreads: {
+          include: {
+            messages: {
+              orderBy: { createdAt: "asc" },
+            },
+          },
+        },
+      },
+    });
+  });
+}
+
 export async function scheduleAckReminderForUnacknowledged(poId: string, hours: number) {
   await db.reminderTask.create({
     data: {
@@ -405,4 +820,308 @@ export async function scheduleAckReminderForUnacknowledged(poId: string, hours: 
       status: ReminderTaskStatus.PENDING,
     },
   });
+}
+
+export async function runAckReminderJob(limit = 50) {
+  const dueTasks = await db.reminderTask.findMany({
+    where: {
+      type: ReminderTaskType.ACK_REMINDER,
+      status: ReminderTaskStatus.PENDING,
+      runAt: {
+        lte: new Date(),
+      },
+    },
+    orderBy: {
+      runAt: "asc",
+    },
+    take: limit,
+  });
+
+  const result = {
+    scanned: dueTasks.length,
+    reminded: 0,
+    skipped: 0,
+    failed: 0,
+  };
+
+  for (const task of dueTasks) {
+    try {
+      await db.$transaction(async (tx) => {
+        const lock = await tx.reminderTask.updateMany({
+          where: {
+            id: task.id,
+            status: ReminderTaskStatus.PENDING,
+          },
+          data: {
+            status: ReminderTaskStatus.RUNNING,
+          },
+        });
+
+        if (lock.count === 0) {
+          return;
+        }
+
+        const currentTask = await tx.reminderTask.findUnique({
+          where: { id: task.id },
+          include: {
+            purchaseOrder: {
+              include: {
+                supplier: true,
+                emailThreads: {
+                  orderBy: { createdAt: "asc" },
+                },
+              },
+            },
+          },
+        });
+
+        if (!currentTask) {
+          return;
+        }
+
+        const po = currentTask.purchaseOrder;
+
+        if (po.status === PurchaseOrderStatus.ACKNOWLEDGED || po.status === PurchaseOrderStatus.CLOSED) {
+          await tx.reminderTask.update({
+            where: { id: currentTask.id },
+            data: {
+              status: ReminderTaskStatus.COMPLETED,
+              attempts: {
+                increment: 1,
+              },
+            },
+          });
+          result.skipped += 1;
+          return;
+        }
+
+        const thread =
+          po.emailThreads[0] ??
+          (await tx.emailThread.create({
+            data: {
+              purchaseOrderId: po.id,
+              supplierId: po.supplierId,
+              subject: `[${po.poNumber}] Purchase Order Thread`,
+            },
+          }));
+
+        await sendOutboundEmail(tx, {
+          threadId: thread.id,
+          fromEmail: "buyer@demo-manufacturing.example",
+          toEmails: [po.supplier.primaryEmail, ...po.supplier.ccEmails],
+          subject: `[${po.poNumber}] Reminder: Acknowledgment Pending`,
+          body: `Hello ${po.supplier.name},\n\nThis is a reminder to acknowledge PO ${po.poNumber}. Please confirm line-level EDDs.\n\nRegards,\nPurchase Team`,
+          intent: "ack_reminder_24h",
+          senderType: SenderType.AGENT,
+        });
+
+        await tx.purchaseOrder.update({
+          where: { id: po.id },
+          data: {
+            status: PurchaseOrderStatus.ACK_PENDING,
+          },
+        });
+
+        await tx.agentRun.create({
+          data: {
+            purchaseOrderId: po.id,
+            trigger: AgentRunTrigger.ACK_REMINDER_DUE,
+            model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+            decision: "24-hour acknowledgment reminder sent to supplier.",
+            status: AgentRunStatus.SUCCESS,
+          },
+        });
+
+        await tx.reminderTask.update({
+          where: { id: currentTask.id },
+          data: {
+            status: ReminderTaskStatus.COMPLETED,
+            attempts: {
+              increment: 1,
+            },
+          },
+        });
+
+        result.reminded += 1;
+      });
+    } catch {
+      result.failed += 1;
+      await db.reminderTask.update({
+        where: { id: task.id },
+        data: {
+          status: ReminderTaskStatus.FAILED,
+          attempts: {
+            increment: 1,
+          },
+        },
+      });
+    }
+  }
+
+  return result;
+}
+
+export async function runEddOverdueJob(limit = 100) {
+  const dueTasks = await db.reminderTask.findMany({
+    where: {
+      type: ReminderTaskType.EDD_OVERDUE_FOLLOWUP,
+      status: ReminderTaskStatus.PENDING,
+      runAt: {
+        lte: new Date(),
+      },
+    },
+    orderBy: {
+      runAt: "asc",
+    },
+    take: limit,
+  });
+
+  const result = {
+    scanned: dueTasks.length,
+    overdueFollowups: 0,
+    skipped: 0,
+    failed: 0,
+  };
+
+  for (const task of dueTasks) {
+    try {
+      await db.$transaction(async (tx) => {
+        const lock = await tx.reminderTask.updateMany({
+          where: {
+            id: task.id,
+            status: ReminderTaskStatus.PENDING,
+          },
+          data: {
+            status: ReminderTaskStatus.RUNNING,
+          },
+        });
+
+        if (lock.count === 0) {
+          return;
+        }
+
+        const currentTask = await tx.reminderTask.findUnique({
+          where: { id: task.id },
+          include: {
+            purchaseOrder: {
+              include: {
+                supplier: true,
+                emailThreads: {
+                  orderBy: { createdAt: "asc" },
+                },
+              },
+            },
+            poLine: {
+              include: {
+                material: true,
+              },
+            },
+          },
+        });
+
+        if (!currentTask || !currentTask.poLine) {
+          await tx.reminderTask.update({
+            where: { id: task.id },
+            data: {
+              status: ReminderTaskStatus.COMPLETED,
+              attempts: {
+                increment: 1,
+              },
+            },
+          });
+          result.skipped += 1;
+          return;
+        }
+
+        const po = currentTask.purchaseOrder;
+        const line = currentTask.poLine;
+
+        if (line.openQty.lte(0) || line.lineStatus === PurchaseOrderLineStatus.RECEIVED) {
+          await tx.reminderTask.update({
+            where: { id: task.id },
+            data: {
+              status: ReminderTaskStatus.COMPLETED,
+              attempts: {
+                increment: 1,
+              },
+            },
+          });
+          result.skipped += 1;
+          return;
+        }
+
+        const thread =
+          po.emailThreads[0] ??
+          (await tx.emailThread.create({
+            data: {
+              purchaseOrderId: po.id,
+              supplierId: po.supplierId,
+              subject: `[${po.poNumber}] Purchase Order Thread`,
+            },
+          }));
+
+        await tx.purchaseOrderLine.update({
+          where: { id: line.id },
+          data: {
+            lineStatus: PurchaseOrderLineStatus.OVERDUE,
+          },
+        });
+
+        await sendOutboundEmail(tx, {
+          threadId: thread.id,
+          fromEmail: "buyer@demo-manufacturing.example",
+          toEmails: [po.supplier.primaryEmail, ...po.supplier.ccEmails],
+          subject: `[${po.poNumber}] Overdue Follow-up for ${line.material.name}`,
+          body: `Hello ${po.supplier.name},\n\nDelivery for ${line.material.name} is overdue. Open quantity is ${line.openQty.toString()}. Please share revised line-level EDD and any staggered delivery split.\n\nRegards,\nPurchase Team`,
+          intent: "edd_overdue_followup",
+          senderType: SenderType.AGENT,
+        });
+
+        await tx.agentRun.create({
+          data: {
+            purchaseOrderId: po.id,
+            trigger: AgentRunTrigger.EDD_OVERDUE,
+            model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+            decision: `Overdue follow-up sent for line ${line.id}.`,
+            status: AgentRunStatus.SUCCESS,
+          },
+        });
+
+        await tx.reminderTask.update({
+          where: { id: task.id },
+          data: {
+            status: ReminderTaskStatus.COMPLETED,
+            attempts: {
+              increment: 1,
+            },
+          },
+        });
+
+        await tx.reminderTask.create({
+          data: {
+            purchaseOrderId: po.id,
+            poLineId: line.id,
+            type: ReminderTaskType.EDD_OVERDUE_FOLLOWUP,
+            runAt: addDays(new Date(), 1),
+            status: ReminderTaskStatus.PENDING,
+          },
+        });
+
+        result.overdueFollowups += 1;
+      });
+    } catch {
+      result.failed += 1;
+      await db.reminderTask.update({
+        where: { id: task.id },
+        data: {
+          status: ReminderTaskStatus.FAILED,
+          attempts: {
+            increment: 1,
+          },
+        },
+      });
+    }
+  }
+
+  return result;
 }

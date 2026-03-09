@@ -3,6 +3,7 @@ import type { Route } from "next";
 
 const links = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/demo-run", label: "Demo Run" },
   { href: "/suppliers", label: "Suppliers" },
   { href: "/materials", label: "Materials" },
   { href: "/purchase-orders", label: "Purchase Orders" },

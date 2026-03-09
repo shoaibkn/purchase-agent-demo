@@ -33,6 +33,12 @@ enum MessageDirection {
   INBOUND
 }
 
+enum SenderType {
+  PURCHASER
+  AGENT
+  SUPPLIER
+}
+
 enum AgentRunTrigger {
   PO_CREATED
   SUPPLIER_REPLY_RECEIVED
@@ -175,6 +181,7 @@ model EmailThread {
 model EmailMessage {
   id          String           @id @default(cuid())
   direction   MessageDirection
+  senderType  SenderType?
   fromEmail   String
   toEmails    String[]
   subject     String
@@ -221,6 +228,7 @@ model AppSetting {
   defaultModel      String   @default("gpt-4.1-mini")
   supplierMode      String   @default("rule_based")
   ackReminderHours  Int      @default(24)
+  useRealEmail      Boolean  @default(false)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 }
