@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f1ea;
+  --foreground: #1c2520;
+  --card: #fffdf8;
+  --card-border: #d9d3c5;
+  --muted: #66736b;
+  --accent: #235347;
+}
+
+body {
+  background: radial-gradient(circle at 20% 10%, #fff8ea 0%, var(--background) 55%);
+  color: var(--foreground);
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}

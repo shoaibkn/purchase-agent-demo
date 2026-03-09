@@ -1,0 +1,50 @@
+{
+  "name": "purchase-agent-demo",
+  "version": "1.0.0",
+  "description": "Purchase agent demo for manufacturing procurement workflows",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:seed": "tsx prisma/seed.ts"
+  },
+  "keywords": [
+    "nextjs",
+    "prisma",
+    "neon",
+    "langchain",
+    "procurement"
+  ],
+  "dependencies": {
+    "@langchain/core": "^1.1.31",
+    "@langchain/openai": "^1.2.12",
+    "@prisma/client": "^6.16.2",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "langchain": "^1.2.30",
+    "next": "^16.1.6",
+    "openai": "^6.27.0",
+    "prisma": "^6.16.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
+    "@types/node": "^25.3.5",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.39.4",
+    "eslint-config-next": "^16.1.6",
+    "tailwindcss": "^4.2.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}

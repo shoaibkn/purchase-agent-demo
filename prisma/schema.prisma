@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PurchaseOrderStatus {
+  CREATED
+  SENT
+  ACK_PENDING
+  ACKNOWLEDGED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+enum PurchaseOrderLineStatus {
+  PENDING_CONFIRMATION
+  DATE_NEGOTIATION
+  CONFIRMED
+  OVERDUE
+  RESCHEDULED
+  PARTIALLY_RECEIVED
+  RECEIVED
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum AgentRunTrigger {
+  PO_CREATED
+  SUPPLIER_REPLY_RECEIVED
+  ACK_REMINDER_DUE
+  EDD_OVERDUE
+  GOODS_RECEIPT_CREATED
+}
+
+enum AgentRunStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum ReminderTaskType {
+  ACK_REMINDER
+  EDD_OVERDUE_FOLLOWUP
+}
+
+enum ReminderTaskStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model Supplier {
+  id           String   @id @default(cuid())
+  name         String
+  primaryEmail String   @unique
+  ccEmails     String[]
+  timezone     String?
+  paymentTerms String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  purchaseOrders PurchaseOrder[]
+  emailThreads    EmailThread[]
+}
+
+model Material {
+  id                  String   @id @default(cuid())
+  sku                 String   @unique
+  name                String
+  description         String?
+  uom                 String
+  defaultLeadTimeDays Int?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  poLines PurchaseOrderLine[]
+}
+
+model PurchaseOrder {
+  id         String              @id @default(cuid())
+  poNumber   String              @unique
+  status     PurchaseOrderStatus @default(CREATED)
+  notes      String?
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  supplierId String
+
+  supplier      Supplier       @relation(fields: [supplierId], references: [id])
+  lines         PurchaseOrderLine[]
+  goodsReceipts GoodsReceipt[]
+  emailThreads  EmailThread[]
+  agentRuns     AgentRun[]
+  reminderTasks ReminderTask[]
+}
+
+model PurchaseOrderLine {
+  id             String                  @id @default(cuid())
+  orderedQty     Decimal                 @db.Decimal(14, 3)
+  openQty        Decimal                 @db.Decimal(14, 3)
+  unitPrice      Decimal?                @db.Decimal(14, 3)
+  requestedDate  DateTime?
+  approvedDate   DateTime?
+  latestEdd      DateTime?
+  lineStatus     PurchaseOrderLineStatus @default(PENDING_CONFIRMATION)
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+  purchaseOrderId String
+  materialId     String
+
+  purchaseOrder       PurchaseOrder         @relation(fields: [purchaseOrderId], references: [id])
+  material            Material              @relation(fields: [materialId], references: [id])
+  deliveryCommitments DeliveryCommitment[]
+  goodsReceiptLines   GoodsReceiptLine[]
+  reminderTasks       ReminderTask[]
+}
+
+model DeliveryCommitment {
+  id           String   @id @default(cuid())
+  promisedDate DateTime
+  promisedQty  Decimal  @db.Decimal(14, 3)
+  source       String
+  version      Int      @default(1)
+  createdAt    DateTime @default(now())
+  poLineId     String
+
+  poLine PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+}
+
+model GoodsReceipt {
+  id              String   @id @default(cuid())
+  reference       String?
+  receivedAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
+  purchaseOrderId String
+
+  purchaseOrder PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id])
+  lines         GoodsReceiptLine[]
+}
+
+model GoodsReceiptLine {
+  id            String  @id @default(cuid())
+  receivedQty   Decimal @db.Decimal(14, 3)
+  acceptedQty   Decimal @db.Decimal(14, 3)
+  rejectedQty   Decimal @db.Decimal(14, 3)
+  goodsReceiptId String
+  poLineId      String
+
+  goodsReceipt GoodsReceipt      @relation(fields: [goodsReceiptId], references: [id])
+  poLine       PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+}
+
+model EmailThread {
+  id              String   @id @default(cuid())
+  subject         String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  supplierId      String
+  purchaseOrderId String
+
+  supplier      Supplier      @relation(fields: [supplierId], references: [id])
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  messages      EmailMessage[]
+}
+
+model EmailMessage {
+  id          String           @id @default(cuid())
+  direction   MessageDirection
+  fromEmail   String
+  toEmails    String[]
+  subject     String
+  body        String
+  intent      String?
+  metadata    Json?
+  createdAt   DateTime         @default(now())
+  threadId    String
+
+  thread EmailThread @relation(fields: [threadId], references: [id])
+}
+
+model AgentRun {
+  id              String          @id @default(cuid())
+  trigger         AgentRunTrigger
+  model           String
+  decision        String
+  status          AgentRunStatus  @default(PENDING)
+  createdAt       DateTime        @default(now())
+  purchaseOrderId String
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+}
+
+model ReminderTask {
+  id              String             @id @default(cuid())
+  type            ReminderTaskType
+  status          ReminderTaskStatus @default(PENDING)
+  runAt           DateTime
+  attempts        Int                @default(0)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  purchaseOrderId String
+  poLineId        String?
+
+  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id])
+  poLine       PurchaseOrderLine?  @relation(fields: [poLineId], references: [id])
+
+  @@index([status, runAt])
+}
+
+model AppSetting {
+  id                String   @id @default(cuid())
+  defaultModel      String   @default("gpt-4.1-mini")
+  supplierMode      String   @default("rule_based")
+  ackReminderHours  Int      @default(24)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
